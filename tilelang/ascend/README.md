@@ -225,6 +225,20 @@ TileLang path divides the work as follows:
 Automatic scheduling handles task order and dependencies; it does not imply
 automatic tensorization of arbitrary `T.Parallel` code into SIMD instructions.
 
+### Scaled L0C-to-UB copies
+
+On Ascend 950, `T.copy(..., fix_scale=scale)` applies a scalar FIX scale
+while copying an FP32 L0C accumulator into ND FP16, BF16, or FP32 UB.
+`T.dual_copy` supports the same scale for an M split into equal, aligned
+row halves. Scaled copies require explicit FIX synchronization
+(`unit_flag_ctrl=0`) and a zero-origin L0C tile.
+
+The scale must encode as a finite positive normal FP32 value. The hardware
+uses its exponent and leading ten fraction bits. Storing the scaled result
+in FP32 still uses the FIX instruction's limited arithmetic precision.
+Use a separate FP32 multiply if the application requires FP32 multiply
+semantics. [Ascend 950 FIX store modes](https://asc.gitcode.com/api/SIMD-API/c_api/cube_datamove/asc_copy_l0c2ub.html)
+
 ### Batched GM-to-L1 copies
 
 With the Ascend C target, `T.copy` can transfer a three-dimensional

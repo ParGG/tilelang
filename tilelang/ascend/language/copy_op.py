@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from math import prod
+from math import isfinite, prod
+from struct import pack, unpack
 from typing import Any
 
 from tilelang._typing import BufferLikeType
@@ -56,6 +57,7 @@ def dual_copy(
     *,
     unit_flag_ctrl: int | tirx.PrimExpr | None = None,
     l2_cache_ctrl: int | str = 0,
+    fix_scale: float | None = None,
 ) -> tirx.PrimExpr | tirx.Stmt:
     """Copy a region using an M- or N-split across the two AIVs.
 
@@ -74,7 +76,8 @@ def dual_copy(
     dimension must have a 2:1 extent ratio between source and destination. The
     supported memory paths are:
 
-    - L0C→UB: lowered as a hardware dual-destination copy.
+    - L0C→UB: unscaled copies use hardware dual-destination mode. With
+      ``fix_scale``, an M split uses one hardware FIX copy per AIV.
     - GM→UB, UB→GM, and UB→L1: lowered as an ordinary per-AIV copy
       indexed by the ``cthread`` sid.
 
@@ -94,6 +97,10 @@ def dual_copy(
     Args:
         src: Source region in GM, L0C, or UB, according to the supported paths.
         dst: Destination region in UB, GM, or L1, according to the supported paths.
+        fix_scale: Optional scalar FIX scale for an M-split FP32 L0C to
+            ND FP16, BF16, or FP32 UB drain. Each AIV receives one
+            single-destination FIX drain. FP32 storage retains the finite
+            precision of the hardware scaling operation.
         unit_flag_ctrl: Unit flag control (0=manual sync, 3=pipelined with mad).
             ``None`` omits the annotation and lowers as 0.
         l2_cache_ctrl (int | str): Ascend L2 cache control policy for the UB→GM
@@ -143,7 +150,9 @@ def dual_copy(
     # silently produce incorrect results.
     src_dtype = src_region.buffer.dtype
     dst_dtype = dst_region.buffer.dtype
-    if src_dtype != dst_dtype and src_region.buffer.scope() == "shared.l0c":
+    if fix_scale is not None and dual_dst_ctl != 1:
+        raise ValueError("dual_copy fix_scale requires an M-split L0C to UB drain")
+    if fix_scale is None and src_dtype != dst_dtype and src_region.buffer.scope() == "shared.l0c":
         raise ValueError(
             f"dual_copy: src dtype ({src_dtype}) != dst dtype ({dst_dtype}). "
             "Type conversion during cc->ub dual-destination copy is NOT supported on dav-950. "
@@ -160,6 +169,7 @@ def dual_copy(
         annotations=annotations,
         unit_flag_ctrl=unit_flag_ctrl,
         l2_cache_ctrl=l2_cache_ctrl,
+        fix_scale=fix_scale,
     )
 
 
@@ -234,6 +244,7 @@ def copy(  # noqa: A001
     coalesced_width: int | None = None,
     transpose: bool = False,
     l0_pitch: int | tirx.PrimExpr | None = None,
+    fix_scale: float | None = None,
     l2_cache_ctrl: int | str | None = None,
     unit_flag_ctrl: int | tirx.PrimExpr | None = None,
     sub_blockid: int | tirx.PrimExpr | None = None,
@@ -283,6 +294,10 @@ def copy(  # noqa: A001
             overrides the source pitch. Use ``ceildiv(M, 16)`` for A/C and
             ``ceildiv(N, 16)`` for B, including MajorMN transposed loads.
             May vary at runtime. ``None`` keeps the compact region pitch.
+        fix_scale (float | None, keyword-only): Scale the FP32 L0C accumulator
+            during a FIX drain to ND FP16, BF16, or FP32 UB. The scale
+            retains the FP32 exponent and the leading ten fraction bits.
+            FP32 output uses limited-precision hardware scaling.
         l2_cache_ctrl (Optional[Union[int, str]], keyword-only): L2 cache
             control for the GM↔L1 and UB↔GM DMA paths. Accepts the raw integer
             or a cache-policy name (case-insensitive, suffix-matched), e.g.
@@ -324,6 +339,30 @@ def copy(  # noqa: A001
         dst = to_buffer_region(dst, access_type="w")
 
     ann = _normalize_annotations(annotations)
+    if fix_scale is not None and "fix_scale_bits" not in ann:
+        if isinstance(fix_scale, bool) or not isinstance(fix_scale, (float, int)) or fix_scale <= 0:
+            raise ValueError("Ascend T.copy fix_scale must be a finite positive scalar")
+        try:
+            if not isfinite(fix_scale):
+                raise ValueError("Ascend T.copy fix_scale must be a finite positive scalar")
+            descriptor = unpack("<I", pack("<f", fix_scale))[0] & 0xFFFFE000
+        except OverflowError:
+            raise ValueError("Ascend T.copy fix_scale must encode a normal FP32 scale") from None
+        if (descriptor & 0x7F800000) in (0, 0x7F800000):
+            raise ValueError("Ascend T.copy fix_scale must encode a normal FP32 scale")
+        ann["fix_scale_bits"] = tirx.IntImm("uint64", descriptor)
+    if "fix_scale_bits" in ann:
+        src_buf = src if isinstance(src, tirx.Buffer) else src.buffer
+        dst_buf = dst if isinstance(dst, tirx.Buffer) else dst.buffer
+        if not (
+            src_buf.scope() in ("shared.l0c", "shared.l0c.dyn")
+            and dst_buf.scope() in ("shared", "shared.dyn")
+            and str(src_buf.dtype) == "float32"
+            and str(dst_buf.dtype) in ("float16", "bfloat16", "float32")
+            and len(src_buf.shape) >= 2
+            and len(dst_buf.shape) >= 2
+        ):
+            raise ValueError("Ascend T.copy fix_scale requires an FP32 L0C to FP16, BF16, or FP32 UB matrix drain")
 
     if l0_pitch is not None and "l0_pitch" not in ann:
         ann["l0_pitch"] = l0_pitch

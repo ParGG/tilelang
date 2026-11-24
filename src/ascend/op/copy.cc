@@ -131,6 +131,17 @@ static int GetCCQuantPre(DataType src_dtype, DataType dst_dtype) {
   return 0; // NoQuant
 }
 
+// Scalar prequantization modes for the Ascend 950 L0C-to-UB drain.
+static int GetCCFixScaleQuantPre(DataType dst_dtype) {
+  if (dst_dtype.is_float16())
+    return 32; // QF322F16_PRE
+  if (dst_dtype.is_bfloat16())
+    return 34; // QF322BF16_PRE
+  if (dst_dtype == DataType::Float(32))
+    return 15; // QF322F32_PRE
+  return 0;
+}
+
 void CheckCompactL0Region(const Buffer &buffer, const Array<Range> &ranges,
                           arith::Analyzer *analyzer,
                           const std::string &description) {
@@ -447,6 +458,8 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
   PrimExpr src_ptr = make_access_ptr(op.src, src_range, src_region_elements, 1);
   PrimExpr dst_ptr = make_access_ptr(op.dst, dst_range, dst_region_elements, 2);
 
+  const auto fix_scale = op.annotations.Get("fix_scale_bits");
+  Stmt fix_copy;
   PrimExpr sid = I(0);
   PrimExpr zero = I(0);
   PrimExpr l2_cache_ctrl = I(op.L2CacheCtrlOr(0));
@@ -733,6 +746,22 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
     }
 
     int dual_dst_ctl = op.dual_dst_ctl;
+    const bool split_scaled = fix_scale && dual_dst_ctl == 1;
+    int quant_pre = GetCCQuantPre(op.src->dtype, op.dst->dtype);
+    if (fix_scale) {
+      quant_pre = GetCCFixScaleQuantPre(op.dst->dtype);
+      int64_t bits = Downcast<IntImm>(fix_scale.value())->value;
+      TVM_FFI_CHECK(
+          bits > 0 && bits <= 0x7f7fe000 && (bits & 0x1fff) == 0 &&
+              (bits & 0x7f800000) != 0 &&
+              op.src->dtype == DataType::Float(32) &&
+              quant_pre != 0 && !nz_output &&
+              (dual_dst_ctl == 0 || split_scaled) &&
+              analyzer->CanProveEqual(op.unit_flag_ctl, I(0)),
+          ValueError)
+          << "Ascend fix_scale requires a normal FP32 scale, ND FP16, BF16, "
+             "or FP32 UB and explicit FIX synchronization (unit_flag_ctrl=0)";
+    }
     PrimExpr copy_inner = src_inner.size;
     PrimExpr copy_rows = src_row.size;
     if (dual_dst_ctl == 0) {
@@ -784,9 +813,26 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
       for (size_t i = physical_shape.size() - 3; i < physical_shape.size(); ++i)
         dst_row_stride = dst_row_stride * physical_shape[i];
     }
-    PrimExpr dual_dst_ctl_val = I(dual_dst_ctl);
+    PrimExpr second_src_ptr;
+    if (split_scaled) {
+      TVM_FFI_CHECK(
+          analyzer->CanProveEqual(copy_rows, dst_row.size * I(2)) &&
+              analyzer->CanProveEqual(copy_inner, dst_inner.size) &&
+              analyzer->CanProveEqual(FloorMod(dst_row.size, I(16)), I(0)) &&
+              analyzer->CanProveEqual(FloorMod(copy_inner, I(16)), I(0)),
+          ValueError)
+          << "Scaled Ascend M-split FIX requires aligned equal row halves";
+      copy_rows = dst_row.size;
+      Array<Range> second_src_range = src_range;
+      second_src_range.Set(src_range.size() - 2,
+                           Range::FromMinExtent(copy_rows, copy_rows));
+      second_src_ptr =
+          make_access_ptr(op.src, second_src_range, dst_region_elements, 1);
+    }
+    PrimExpr dual_dst_ctl_val = I(split_scaled ? 0 : dual_dst_ctl);
     PrimExpr unit_flag_ctl_val = cast(DataType::Int(32), op.unit_flag_ctl);
-    PrimExpr sub_blockid_val = cast(DataType::Int(32), op.sub_blockid);
+    PrimExpr sub_blockid_val =
+        split_scaled ? I(0) : cast(DataType::Int(32), op.sub_blockid);
     call = Call(DataType::Void(), ascend_copy_matrix_cc_to_ub(),
                 {dst_ptr,
                  src_ptr,
@@ -799,7 +845,7 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
                  sub_blockid_val,   // sub_blockid
                  zero,              // clip_relu_pre
                  unit_flag_ctl_val, // unit_flag_ctl
-                 I(GetCCQuantPre(op.src->dtype, op.dst->dtype)), // quant_pre
+                 I(quant_pre),                                   // quant_pre
                  zero,                                           // relu_pre
                  zero,                                           // split_en
                  I(nz_output ? 0 : 1),                           // NZ2ND_en
@@ -814,6 +860,23 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
                  zero,   // wino_post_en
                  zero,   // broadcast_en
                  zero}); // NZ2DN_en
+    if (fix_scale) {
+      Stmt set_scale = Evaluate(Call(
+          DataType::Void(), builtin::call_extern(),
+          {StringImm("asc_set_l0c_copy_prequant"),
+           Downcast<PrimExpr>(fix_scale.value())}));
+      if (split_scaled) {
+        Array<PrimExpr> second_args = call.as<CallNode>()->args;
+        // Route the second row half to AIV 1.
+        second_args.Set(1, second_src_ptr);
+        second_args.Set(8, I(1));
+        Stmt second = Evaluate(Call(DataType::Void(),
+                                    ascend_copy_matrix_cc_to_ub(), second_args));
+        fix_copy = SeqStmt({set_scale, Evaluate(call), second});
+      } else {
+        fix_copy = SeqStmt({set_scale, Evaluate(call)});
+      }
+    }
   } else if (dma_path == DMAPath::kUBToL1) {
     ICHECK(!op.nd2nz)
         << "Ascend nd2nz UB->L1 copy must be emitted directly from the Python "
@@ -943,7 +1006,7 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
     LOG(FATAL) << "Unknown Ascend DMA path";
   }
 
-  Stmt copy_stmt = Evaluate(call);
+  Stmt copy_stmt = fix_copy.defined() ? fix_copy : Evaluate(call);
   if (!is_one(has_data) && !analyzer->CanProve(has_data)) {
     copy_stmt = IfThenElse(has_data, copy_stmt);
   }
@@ -1169,20 +1232,22 @@ struct AscendCopyImpl {
                     arith::Analyzer *analyzer) {
     ICHECK(!IsL0SFBuffer(op.src))
         << "L0 SF handles can only be read by gemm_blockscaled";
+    const DMAPath dma_path = GetDMAPath(op.src, op.dst);
+    const bool use_dma = !IsInsideSimtVF(T) && !IsLocalBuffer(op.src) &&
+                         !IsLocalBuffer(op.dst) && dma_path != DMAPath::kNone;
+    TVM_FFI_CHECK(!op.annotations.Get("fix_scale_bits") ||
+                      (use_dma && dma_path == DMAPath::kL0CToUB),
+                  ValueError)
+        << "Ascend fix_scale requires an L0C->UB DMA copy outside SIMT VF";
     if (IsL0SFBuffer(op.dst)) {
-      DMAPath dma_path = GetDMAPath(op.src, op.dst);
       ICHECK(dma_path == DMAPath::kL1ToL0ASF || dma_path == DMAPath::kL1ToL0BSF)
           << "Ascend MX scale-factor copy expects an L1 source and an "
              "L0A/L0B SF handle destination, got "
           << op.src.scope() << " -> " << op.dst.scope();
       return LowerMxSfLoad(op, T, analyzer, dma_path == DMAPath::kL1ToL0ASF);
     }
-    if (!IsInsideSimtVF(T) && !IsLocalBuffer(op.src) &&
-        !IsLocalBuffer(op.dst)) {
-      DMAPath dma_path = GetDMAPath(op.src, op.dst);
-      if (dma_path != DMAPath::kNone) {
-        return LowerDMACopy(op, T, analyzer, dma_path);
-      }
+    if (use_dma) {
+      return LowerDMACopy(op, T, analyzer, dma_path);
     }
 
     return LowerAscendNormalCopy(op, T, analyzer);
